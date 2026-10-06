@@ -71,6 +71,10 @@ public class SocketsUDPClient : SocketsClientBase
         try
         {
             m_socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            // En Windows un socket UDP debe estar enlazado ANTES de recibir. Sin este Bind el hilo de
+            // recepcion muere al instante: el servidor ve el JOIN, el cliente nunca recibe la
+            // respuesta, no manda PING y el servidor lo expulsa por timeout.
+            m_socket.Bind(new IPEndPoint(IPAddress.Any, 0));
             LobbyNet.DisableUdpConnReset(m_socket);
             m_serverEndPoint = new IPEndPoint(address, port);
         }
@@ -138,6 +142,11 @@ public class SocketsUDPClient : SocketsClientBase
                 if (!m_running) return;
                 if (e.SocketErrorCode == SocketError.ConnectionReset) continue;
                 m_lost = true;
+                return;
+            }
+            catch (Exception)
+            {
+                if (m_running) m_lost = true;   // que el hilo no muera en silencio
                 return;
             }
 
