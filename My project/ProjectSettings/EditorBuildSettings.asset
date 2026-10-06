@@ -7,6 +7,21 @@ EditorBuildSettings:
   m_Scenes:
   - enabled: 1
     path: Assets/Lab2/Scenes/S_CreateGame_UDP.unity
-    guid: e7907614de83d484b816010e7738d453
+    guid: 1924a584cc3fe8b42b81b32bb7b8e6a0
+  - enabled: 1
+    path: Assets/Lab2/Scenes/S_CreateGame_TCP.unity
+    guid: b1783503b41b1db47ba0ae58ecba5433
+  - enabled: 1
+    path: Assets/Lab2/Scenes/S_Game.unity
+    guid: bfa1387957efdbb41beb76bd770b0902
+  - enabled: 1
+    path: Assets/Lab2/Scenes/S_JoinGame_TCP.unity
+    guid: 84ca23d975b34924db70039bfff0dc81
+  - enabled: 1
+    path: Assets/Lab2/Scenes/S_JoinGame_UDP.unity
+    guid: a75564f23feb97d4b9ccc7549b9e5021
+  - enabled: 1
+    path: Assets/Lab2/Scenes/S_Room_TCP.unity
+    guid: 1c34d5d3a69add942a714707df3a7a03
   m_configObjects:
     com.unity.input.settings.actions: {fileID: -944628639613478452, guid: 052faaac586de48259a63d0c4782560b, type: 3}
