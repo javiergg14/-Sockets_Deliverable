@@ -1,172 +1,147 @@
 using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
-using System.Text;
-using System.Threading;
 using TMPro;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
+// Escena S_JoinGame_TCP: nombre + IP + boton Join.
+// Conecta en un hilo (la ventana no se congela), enseña el motivo si falla y,
+// si va bien, manda JOIN y pasa a la sala.
 public class SocketsTCPClient : MonoBehaviour
 {
     public TMP_InputField inputName;
     public TMP_InputField inputIP;
     public int port = 9050;
 
-    private string serverIp;
-    const int MaxPacketSize = 64 * 1024;
+    [Header("Bonus")]
+    public TextMeshProUGUI statusText;       // opcional: si es null se pinta con OnGUI
+    public string roomSceneName = "S_Room_TCP";
 
-    Socket m_connection;
-    readonly List<Thread> m_threads = new List<Thread>();
-    readonly ConcurrentQueue<byte[]> m_inbox = new ConcurrentQueue<byte[]>();
-    volatile bool m_running;
+    Socket m_pending;
+    string m_ip = "";
+    string m_name = "";
+    string m_connectError = "";
+    string m_status = "";
+    volatile int m_state;                     // 0 libre, 1 conectando, 2 conectado, 3 fallo
 
     void Start()
     {
         Application.runInBackground = true;
+
+        // Si venimos de ser expulsados / sala cerrada, lo mostramos
+        if (!string.IsNullOrEmpty(LobbyData.LastMessage))
+        {
+            SetStatus(LobbyData.LastMessage);
+            LobbyData.LastMessage = "";
+        }
     }
 
     public void ConnectToServer()
     {
-        if (m_running || string.IsNullOrEmpty(inputIP.text) || string.IsNullOrEmpty(inputName.text)) return;
+        if (m_state == 1) return;
 
-        serverIp = inputIP.text;
+        string ip = inputIP != null ? inputIP.text.Trim() : "";
+        string rawName = inputName != null ? inputName.text.Trim() : "";
+
+        if (ip.Length == 0 || rawName.Length == 0)
+        {
+            SetStatus("Escribe tu nombre y la IP del servidor");
+            return;
+        }
+
+        if (ip.ToLower() == "localhost") ip = "127.0.0.1";
+
+        IPAddress address;
+        if (!IPAddress.TryParse(ip, out address))
+        {
+            SetStatus("La IP '" + ip + "' no es valida (ejemplo: 192.168.1.20)");
+            return;
+        }
+
+        m_ip = ip;
+        m_name = LobbyNet.CleanName(rawName, 16);
+        m_state = 1;
+        SetStatus("Conectando a " + ip + ":" + port + " ...");
+
+        Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        m_pending = socket;
+        IPEndPoint endpoint = new IPEndPoint(address, port);
+        LobbyNet.StartThread(delegate { ConnectThread(socket, endpoint); });
+    }
+
+    void ConnectThread(Socket socket, IPEndPoint endpoint)
+    {
         try
         {
-            Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            socket.Connect(new IPEndPoint(IPAddress.Parse(serverIp), port));
+            IAsyncResult result = socket.BeginConnect(endpoint, null, null);
+            if (!result.AsyncWaitHandle.WaitOne(3000))
+            {
+                LobbyNet.CloseSocket(socket);
+                m_connectError = "tiempo de espera agotado. Revisa la IP, el firewall del servidor (puerto " + port +
+                                 ") y que la red no aisle los dispositivos";
+                m_state = 3;
+                return;
+            }
 
-            // Guardamos los datos estáticos para la sala
-            SocketsClientRoom.s_activeConnection = socket;
-            SocketsClientRoom.s_playerName = inputName.text;
-            SocketsClientRoom.s_serverIp = serverIp;
-
-            // Enviamos el JOIN inicial antes de cambiar de escena
-            byte[] payload = Encoding.UTF8.GetBytes("JOIN:" + inputName.text);
-            byte[] framed = new byte[4 + payload.Length];
-            BitConverter.GetBytes(payload.Length).CopyTo(framed, 0);
-            payload.CopyTo(framed, 4);
-            socket.Send(framed);
-
-            // Cargamos la escena de la sala
-            SceneManager.LoadScene("S_Room_TCP");
+            socket.EndConnect(result);
+            socket.NoDelay = true;
+            m_state = 2;
         }
-        catch (Exception)
+        catch (Exception e)
         {
-            Debug.Log("No se pudo conectar al servidor.");
+            LobbyNet.CloseSocket(socket);
+            m_connectError = e.Message;
+            m_state = 3;
         }
     }
-
-    public void Disconnect()
-    {
-        if (!m_running) return;
-        m_running = false;
-
-        CloseSocket(m_connection);
-        m_connection = null;
-
-        Thread[] threads;
-        lock (m_threads) { threads = m_threads.ToArray(); m_threads.Clear(); }
-        foreach (Thread t in threads) if (t != Thread.CurrentThread) t.Join(500);
-    }
-
-    void OnDestroy() { Disconnect(); }
 
     void Update()
     {
-        byte[] data;
-        while (m_inbox.TryDequeue(out data))
-            OnPacketReceived(data);
-    }
-
-    void ClientThread()
-    {
-        try { m_connection = StartClient(); }
-        catch (SocketException) { m_running = false; return; }
-
-        if (m_connection == null) return;
-
-        OnConnected();
-        ReceiveLoop(m_connection);
-    }
-
-    Socket StartClient()
-    {
-        Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        socket.Connect(new IPEndPoint(IPAddress.Parse(serverIp), port));
-        return socket;
-    }
-
-    void OnConnected()
-    {
-        SendString("JOIN:" + inputName.text);
-    }
-
-    public void SendString(string text)
-    {
-        if (m_connection == null) return;
-
-        byte[] payload = Encoding.UTF8.GetBytes(text);
-        byte[] framed = new byte[4 + payload.Length];
-        BitConverter.GetBytes(payload.Length).CopyTo(framed, 0);
-        payload.CopyTo(framed, 4);
-
-        try { m_connection.Send(framed); }
-        catch (SocketException) { }
-        catch (ObjectDisposedException) { }
-    }
-
-    void ReceiveLoop(Socket socket)
-    {
-        byte[] header = new byte[4];
-        while (m_running)
+        if (m_state == 2)
         {
-            if (!ReadExactly(socket, header, 4)) return;
+            m_state = 0;
 
-            int size = BitConverter.ToInt32(header, 0);
-            if (size <= 0 || size > MaxPacketSize) return;
+            SocketsClientRoom.s_activeConnection = m_pending;
+            SocketsClientRoom.s_playerName = m_name;
+            SocketsClientRoom.s_serverIp = m_ip;
 
-            byte[] payload = new byte[size];
-            if (!ReadExactly(socket, payload, size)) return;
+            try { m_pending.Send(LobbyNet.Frame("JOIN:" + m_name)); }
+            catch (Exception e)
+            {
+                LobbyNet.CloseSocket(m_pending);
+                SocketsClientRoom.s_activeConnection = null;
+                m_pending = null;
+                SetStatus("No se pudo enviar JOIN: " + e.Message);
+                return;
+            }
 
-            m_inbox.Enqueue(payload);
+            m_pending = null;     // desde ahora el socket es de la escena de la sala
+            SceneManager.LoadScene(roomSceneName);
+        }
+        else if (m_state == 3)
+        {
+            m_state = 0;
+            m_pending = null;
+            SetStatus("No se pudo conectar: " + m_connectError);
         }
     }
 
-    bool ReadExactly(Socket socket, byte[] buffer, int count)
+    void SetStatus(string text)
     {
-        int total = 0;
-        while (total < count)
-        {
-            int read;
-            try { read = socket.Receive(buffer, total, count - total, SocketFlags.None); }
-            catch (Exception) { return false; }
-
-            if (read == 0) return false;
-            total += read;
-        }
-        return true;
+        m_status = text;
+        if (statusText != null) statusText.text = text;
+        Debug.Log(text);
     }
 
-    void OnPacketReceived(byte[] data)
+    void OnGUI()
     {
-        // Aquí puedes gestionar si en el futuro quieres que el cliente cambie de escena al conectarse
+        if (statusText == null) LobbyGui.DrawStatus(m_status);
     }
 
-    void StartThread(ThreadStart work)
+    void OnDestroy()
     {
-        Thread t = new Thread(work);
-        t.IsBackground = true;
-        lock (m_threads) m_threads.Add(t);
-        t.Start();
-    }
-
-    void CloseSocket(Socket socket)
-    {
-        if (socket == null) return;
-        try { socket.Shutdown(SocketShutdown.Both); } catch { }
-        try { socket.Close(); } catch { }
+        // Si salimos sin haber pasado a la sala, no dejamos un socket abierto
+        if (m_pending != null) LobbyNet.CloseSocket(m_pending);
     }
 }

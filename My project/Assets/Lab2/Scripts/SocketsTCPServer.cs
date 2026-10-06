@@ -1,95 +1,22 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
-using System.Text;
 using System.Threading;
-using UnityEngine;
-using TMPro;
 
-public class SocketsTCPServer : MonoBehaviour
+// Transporte TCP del servidor. La logica de la sala esta en SocketsServerBase.
+// Un hilo para Accept y un hilo por cliente (opcion 1 de la diapositiva 3).
+public class SocketsTCPServer : SocketsServerBase
 {
-    public TextMeshProUGUI playersText;
-    public TMP_InputField inputChat;
-    public TextMeshProUGUI chatHistoryText;
-    public int port = 9050;
-    public string serverName = "Host";
-
-    const int MaxPacketSize = 64 * 1024;
-    struct Packet { public byte[] data; public Socket from; }
-
     Socket m_listener;
-    readonly List<Socket> m_clients = new List<Socket>();
-    readonly Dictionary<Socket, string> m_playerNames = new Dictionary<Socket, string>();
-    readonly List<Thread> m_threads = new List<Thread>();
-    readonly ConcurrentQueue<Packet> m_inbox = new ConcurrentQueue<Packet>();
-    volatile bool m_running;
+    readonly List<Socket> m_sockets = new List<Socket>();   // solo se toca desde el hilo principal
 
-    string m_pendingPlayersText = "";
-    bool m_updatePlayersUI = false;
+    public SocketsTCPServer() { createSceneName = "S_CreateGame_TCP"; }
 
-    void Start()
-    {
-        Application.runInBackground = true;
-        StartNetwork();
-    }
+    protected override string TransportName { get { return "Servidor TCP"; } }
+    protected override bool UsesHeartbeatTimeout { get { return false; } }   // TCP avisa solo al cerrarse
 
-    public void StartNetwork()
-    {
-        if (m_running) return;
-        m_running = true;
-        StartThread(ServerThread);
-        UpdateLocalPlayerList();
-    }
-
-    public void SendChatMessage()
-    {
-        if (inputChat == null || string.IsNullOrEmpty(inputChat.text)) return;
-
-        string messageContent = serverName + " (Host): " + inputChat.text;
-
-        if (chatHistoryText != null)
-        {
-            chatHistoryText.text += "\n" + messageContent;
-        }
-
-        BroadcastString("CHAT:" + messageContent);
-        inputChat.text = "";
-    }
-
-    public void Disconnect()
-    {
-        if (!m_running) return;
-        m_running = false;
-
-        Socket[] clients;
-        lock (m_clients) { clients = m_clients.ToArray(); m_clients.Clear(); }
-        foreach (Socket c in clients) CloseSocket(c);
-
-        CloseSocket(m_listener); m_listener = null;
-
-        Thread[] threads;
-        lock (m_threads) { threads = m_threads.ToArray(); m_threads.Clear(); }
-        foreach (Thread t in threads) if (t != Thread.CurrentThread) t.Join(500);
-    }
-
-    void OnDestroy() { Disconnect(); }
-
-    void Update()
-    {
-        Packet packet;
-        while (m_inbox.TryDequeue(out packet))
-            OnPacketReceived(packet.data, packet.from);
-
-        if (m_updatePlayersUI && playersText != null)
-        {
-            playersText.text = m_pendingPlayersText;
-            m_updatePlayersUI = false;
-        }
-    }
-
-    void ServerThread()
+    protected override string OpenNetwork()
     {
         try
         {
@@ -97,154 +24,81 @@ public class SocketsTCPServer : MonoBehaviour
             m_listener.Bind(new IPEndPoint(IPAddress.Any, port));
             m_listener.Listen(10);
         }
-        catch (SocketException) { return; }
+        catch (Exception e)
+        {
+            LobbyNet.CloseSocket(m_listener);
+            m_listener = null;
+            return e.Message;
+        }
 
+        Socket listener = m_listener;
+        LobbyNet.StartThread(delegate { AcceptLoop(listener); });
+        return null;
+    }
+
+    void AcceptLoop(Socket listener)
+    {
         while (m_running)
         {
             Socket client;
-            try { client = m_listener.Accept(); }
-            catch (Exception) { break; }
-
-            lock (m_clients) m_clients.Add(client);
-            Socket captured = client;
-            StartThread(delegate { ClientThread(captured); });
-        }
-    }
-
-    void ClientThread(Socket client)
-    {
-        ReceiveLoop(client);
-
-        lock (m_clients)
-        {
-            m_clients.Remove(client);
-            m_playerNames.Remove(client);
-        }
-        CloseSocket(client);
-        BroadcastPlayerList();
-    }
-
-    void ReceiveLoop(Socket socket)
-    {
-        byte[] header = new byte[4];
-        while (m_running)
-        {
-            if (!ReadExactly(socket, header, 4)) return;
-
-            int size = BitConverter.ToInt32(header, 0);
-            if (size <= 0 || size > MaxPacketSize) return;
-
-            byte[] payload = new byte[size];
-            if (!ReadExactly(socket, payload, size)) return;
-
-            m_inbox.Enqueue(new Packet { data = payload, from = socket });
-        }
-    }
-
-    bool ReadExactly(Socket socket, byte[] buffer, int count)
-    {
-        int total = 0;
-        while (total < count)
-        {
-            int read;
-            try { read = socket.Receive(buffer, total, count - total, SocketFlags.None); }
-            catch (Exception) { return false; }
-
-            if (read == 0) return false;
-            total += read;
-        }
-        return true;
-    }
-
-    void OnPacketReceived(byte[] data, Socket from)
-    {
-        string text = Encoding.UTF8.GetString(data);
-
-        if (text.StartsWith("JOIN:"))
-        {
-            string playerName = text.Substring(5);
-            lock (m_clients)
+            try { client = listener.Accept(); }
+            catch (ObjectDisposedException) { return; }
+            catch (SocketException)
             {
-                m_playerNames[from] = playerName;
-            }
-            BroadcastPlayerList();
-        }
-        else if (text.StartsWith("CHAT:"))
-        {
-            string msg = text.Substring(5);
-            string senderName = "Desconocido";
-            lock (m_clients)
-            {
-                if (m_playerNames.ContainsKey(from)) senderName = m_playerNames[from];
+                if (!m_running) return;
+                Thread.Sleep(50);
+                continue;
             }
 
-            string fullMessage = senderName + ": " + msg;
+            try { client.NoDelay = true; client.SendTimeout = 1000; } catch (Exception) { }
 
-            if (chatHistoryText != null)
+            m_events.Enqueue(new NetEvent { type = NetEventType.Opened, conn = client });
+            LobbyNet.StartThread(delegate { ClientLoop(client); });
+        }
+    }
+
+    void ClientLoop(Socket client)
+    {
+        string text;
+        while (m_running && LobbyNet.ReadFramed(client, out text))
+        {
+            m_events.Enqueue(new NetEvent
             {
-                chatHistoryText.text += "\n" + fullMessage;
-            }
-
-            BroadcastString("CHAT:" + fullMessage);
+                type = NetEventType.Data,
+                conn = client,
+                text = text,
+                ms = LobbyNet.NowMs
+            });
         }
+        // Receive devolvio 0 o lanzo excepcion: boton Leave, ventana cerrada o caida
+        m_events.Enqueue(new NetEvent { type = NetEventType.Closed, conn = client });
     }
 
-    void BroadcastPlayerList()
+    protected override void OnOpened(object conn) { m_sockets.Add((Socket)conn); }
+
+    protected override void OnForget(object conn)
     {
-        string listMsg = "PLAYERS:";
-        lock (m_clients)
-        {
-            List<string> names = new List<string>(m_playerNames.Values);
-            names.Insert(0, serverName + " (Host)");
-
-            listMsg += string.Join(", ", m_playerNames.Values);
-
-            m_pendingPlayersText = "Sala de espera:\n" + string.Join("\n", names);
-            m_updatePlayersUI = true;
-        }
-
-        BroadcastString(listMsg);
+        Socket s = conn as Socket;
+        if (s == null) return;
+        m_sockets.Remove(s);
+        LobbyNet.CloseSocket(s);
     }
 
-    void UpdateLocalPlayerList()
+    protected override void SendTo(object conn, string text)
     {
-        lock (m_clients)
-        {
-            List<string> names = new List<string>(m_playerNames.Values);
-            names.Insert(0, serverName + " (Host)");
-            m_pendingPlayersText = "Sala de espera:\n" + string.Join("\n", names);
-            m_updatePlayersUI = true;
-        }
+        Socket s = conn as Socket;
+        if (s == null) return;
+        try { s.Send(LobbyNet.Frame(text)); }
+        catch (Exception) { }   // si falla, el hilo de ese cliente lo detecta y genera Closed
     }
 
-    void BroadcastString(string text)
+    protected override void DropConnection(object conn) { LobbyNet.CloseSocket(conn as Socket); }
+
+    protected override void CloseNetwork()
     {
-        byte[] payload = Encoding.UTF8.GetBytes(text);
-        byte[] framed = new byte[4 + payload.Length];
-        BitConverter.GetBytes(payload.Length).CopyTo(framed, 0);
-        payload.CopyTo(framed, 4);
-
-        Socket[] targets;
-        lock (m_clients) targets = m_clients.ToArray();
-
-        foreach (Socket c in targets)
-        {
-            try { c.Send(framed); } catch { }
-        }
-    }
-
-    void StartThread(ThreadStart work)
-    {
-        Thread t = new Thread(work);
-        t.IsBackground = true;
-        lock (m_threads) m_threads.Add(t);
-        t.Start();
-    }
-
-    void CloseSocket(Socket socket)
-    {
-        if (socket == null) return;
-        try { socket.Shutdown(SocketShutdown.Both); } catch { }
-        try { socket.Close(); } catch { }
+        foreach (Socket s in m_sockets.ToArray()) LobbyNet.CloseSocket(s);
+        m_sockets.Clear();
+        LobbyNet.CloseSocket(m_listener);
+        m_listener = null;
     }
 }

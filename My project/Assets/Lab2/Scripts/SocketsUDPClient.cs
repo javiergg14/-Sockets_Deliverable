@@ -1,92 +1,147 @@
 using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
-using UnityEngine;
 using TMPro;
+using UnityEngine;
 
-public class SocketsUDPClient : MonoBehaviour
+// Cliente UDP: unirse y sala en la misma escena (S_JoinGame_UDP).
+// UDP no garantiza nada, asi que el JOIN se reintenta hasta que el servidor contesta,
+// y se manda PING: cada segundo para que el servidor sepa que seguimos vivos.
+public class SocketsUDPClient : SocketsClientBase
 {
     public TMP_InputField inputName;
     public TMP_InputField inputIP;
-    public TMP_InputField inputChat;
-    public TextMeshProUGUI playersListText;
-    public TextMeshProUGUI chatHistoryText;
-    public int port = 9050;
 
-    const int MaxPacketSize = 64 * 1024;
+    [Header("Paneles (opcional)")]
+    public GameObject joinPanel;      // nombre + IP + Unirse
+    public GameObject roomPanel;      // lista de jugadores + chat + Salir
 
     Socket m_socket;
     EndPoint m_serverEndPoint;
-    readonly List<Thread> m_threads = new List<Thread>();
-    readonly ConcurrentQueue<byte[]> m_inbox = new ConcurrentQueue<byte[]>();
-    volatile bool m_running;
-    string m_playerName;
+    string m_playerName = "";
+    volatile bool m_confirmed;        // el servidor ya nos ha contestado
+    long m_lastJoinMs;
+    int m_joinAttempts;
+
+    public SocketsUDPClient() { joinSceneName = "S_JoinGame_UDP"; }
+
+    protected override string PlayerName { get { return m_playerName; } }
 
     void Start()
     {
         Application.runInBackground = true;
+        ShowRoom(false);
+        if (!string.IsNullOrEmpty(LobbyData.LastMessage))
+        {
+            SetStatus(LobbyData.LastMessage);
+            LobbyData.LastMessage = "";
+        }
+    }
+
+    void ShowRoom(bool inRoom)
+    {
+        if (joinPanel != null) joinPanel.SetActive(!inRoom);
+        if (roomPanel != null) roomPanel.SetActive(inRoom);
     }
 
     public void ConnectToServer()
     {
-        if (m_running || string.IsNullOrEmpty(inputIP.text) || string.IsNullOrEmpty(inputName.text)) return;
+        if (m_running) return;
 
-        m_playerName = inputName.text;
+        string ip = inputIP != null ? inputIP.text.Trim() : "";
+        string rawName = inputName != null ? inputName.text.Trim() : "";
+
+        if (ip.Length == 0 || rawName.Length == 0)
+        {
+            SetStatus("Escribe tu nombre y la IP del servidor");
+            return;
+        }
+
+        if (ip.ToLower() == "localhost") ip = "127.0.0.1";
+
+        IPAddress address;
+        if (!IPAddress.TryParse(ip, out address))
+        {
+            SetStatus("La IP '" + ip + "' no es valida (ejemplo: 192.168.1.20)");
+            return;
+        }
+
         try
         {
             m_socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-            m_serverEndPoint = new IPEndPoint(IPAddress.Parse(inputIP.text), port);
+            LobbyNet.DisableUdpConnReset(m_socket);
+            m_serverEndPoint = new IPEndPoint(address, port);
         }
-        catch (Exception) { return; }
+        catch (Exception e)
+        {
+            SetStatus("No se pudo crear el socket: " + e.Message);
+            return;
+        }
 
+        m_playerName = LobbyNet.CleanName(rawName, 16);
+        m_confirmed = false;
+        m_joinAttempts = 0;
+        m_lastJoinMs = -1000;           // el primer JOIN sale en el siguiente Update
         m_running = true;
-        StartThread(ReceiveLoop);
-        StartThread(PingLoop);
+        MarkConnected();
+        SetStatus("Conectando a " + ip + ":" + port + " ...");
 
-        SendString("JOIN:" + m_playerName);
-    }
-
-    public void SendChatMessage()
-    {
-        if (inputChat == null || string.IsNullOrEmpty(inputChat.text)) return;
-
-        SendString("CHAT:" + inputChat.text);
-        inputChat.text = "";
-    }
-
-    public void SendString(string text)
-    {
-        if (m_socket == null || m_serverEndPoint == null) return;
-        byte[] payload = Encoding.UTF8.GetBytes(text);
-        try { m_socket.SendTo(payload, m_serverEndPoint); } catch { }
+        Socket socket = m_socket;
+        LobbyNet.StartThread(delegate { ReceiveLoop(socket); });
+        LobbyNet.StartThread(PingLoop);
     }
 
     void Update()
     {
-        byte[] data;
-        while (m_inbox.TryDequeue(out data))
-            OnPacketReceived(data);
+        ProcessInbox();
+
+        if (!m_running || m_confirmed) return;
+
+        long now = LobbyNet.NowMs;
+        if (now - m_lastJoinMs < 1000) return;
+
+        if (m_joinAttempts >= 5)
+        {
+            Disconnected("El servidor no responde. Revisa la IP, el firewall (UDP " + port + ") y que ambos esteis en la misma red", false);
+            return;
+        }
+
+        m_joinAttempts++;
+        m_lastJoinMs = now;
+        SendString("JOIN:" + m_playerName);
     }
 
-    void ReceiveLoop()
+    protected override void OnServerMessage()
     {
-        byte[] buffer = new byte[MaxPacketSize];
+        if (!m_confirmed)
+        {
+            m_confirmed = true;
+            SetStatus("Conectado");
+            ShowRoom(true);
+        }
+    }
+
+    void ReceiveLoop(Socket socket)
+    {
+        byte[] buffer = new byte[LobbyNet.MaxPacketSize];
+
         while (m_running)
         {
             EndPoint from = new IPEndPoint(IPAddress.Any, 0);
             int received;
-            try { received = m_socket.ReceiveFrom(buffer, ref from); }
-            catch (Exception) { break; }
+            try { received = socket.ReceiveFrom(buffer, ref from); }
+            catch (ObjectDisposedException) { return; }
+            catch (SocketException e)
+            {
+                if (!m_running) return;
+                if (e.SocketErrorCode == SocketError.ConnectionReset) continue;
+                m_lost = true;
+                return;
+            }
 
-            if (received <= 0) continue;
-
-            byte[] payload = new byte[received];
-            Array.Copy(buffer, payload, received);
-            m_inbox.Enqueue(payload);
+            if (received > 0) m_inbox.Enqueue(Encoding.UTF8.GetString(buffer, 0, received));
         }
     }
 
@@ -94,53 +149,30 @@ public class SocketsUDPClient : MonoBehaviour
     {
         while (m_running)
         {
-            SendString("PING:");
-            Thread.Sleep(1000); // Enviar ping cada 1 segundo
+            if (m_confirmed) SendString("PING:");
+            Thread.Sleep(1000);
         }
     }
 
-    void OnPacketReceived(byte[] data)
+    public override void SendString(string text)
     {
-        string message = Encoding.UTF8.GetString(data);
+        Socket socket = m_socket;
+        EndPoint server = m_serverEndPoint;
+        if (socket == null || server == null) return;
 
-        if (message.StartsWith("PLAYERS:"))
-        {
-            string playersStr = message.Substring(8);
-            if (playersListText != null)
-            {
-                playersListText.text = "Jugadores en sala:\n" + playersStr.Replace(", ", "\n");
-            }
-        }
-        else if (message.StartsWith("CHAT:"))
-        {
-            string chatMsg = message.Substring(5);
-            if (chatHistoryText != null)
-            {
-                chatHistoryText.text += "\n" + chatMsg;
-            }
-        }
+        try { socket.SendTo(Encoding.UTF8.GetBytes(text), server); }
+        catch (Exception) { }
     }
 
-    public void Disconnect()
+    protected override void OnLeftRoom(string message)
     {
-        if (!m_running) return;
-        SendString("LEAVE:");
-        m_running = false;
-
-        if (m_socket != null) { try { m_socket.Close(); } catch { } m_socket = null; }
-
-        Thread[] threads;
-        lock (m_threads) { threads = m_threads.ToArray(); m_threads.Clear(); }
-        foreach (Thread t in threads) if (t != Thread.CurrentThread) t.Join(500);
+        ShowRoom(false);
+        base.OnLeftRoom(message);
     }
 
-    void OnDestroy() { Disconnect(); }
-
-    void StartThread(ThreadStart work)
+    protected override void CloseConnection()
     {
-        Thread t = new Thread(work);
-        t.IsBackground = true;
-        lock (m_threads) m_threads.Add(t);
-        t.Start();
+        LobbyNet.CloseSocket(m_socket);
+        m_socket = null;
     }
 }
